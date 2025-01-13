@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/spf13/cobra"
 )
 
@@ -31,10 +31,7 @@ func EnableRepoOverride(cmd *cobra.Command, f *Factory) {
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
-		defaultHost, err := config.DefaultHost()
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
+		defaultHost, _ := config.Authentication().DefaultHost()
 
 		var results []string
 		for _, remote := range remotes {

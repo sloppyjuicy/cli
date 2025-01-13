@@ -1,19 +1,21 @@
 package shared
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/ghinstance"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/prompter"
+	"github.com/cli/cli/v2/internal/text"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/shurcooL/githubv4"
-	"github.com/shurcooL/graphql"
 )
 
 type GistFile struct {
@@ -73,7 +75,9 @@ func GistIDFromURL(gistURL string) (string, error) {
 	return "", fmt.Errorf("Invalid gist URL %s", u)
 }
 
-func ListGists(client *http.Client, hostname string, limit int, visibility string) ([]Gist, error) {
+const maxPerPage = 100
+
+func ListGists(client *http.Client, hostname string, limit int, filter *regexp.Regexp, includeContent bool, visibility string) ([]Gist, error) {
 	type response struct {
 		Viewer struct {
 			Gists struct {
@@ -81,6 +85,7 @@ func ListGists(client *http.Client, hostname string, limit int, visibility strin
 					Description string
 					Files       []struct {
 						Name string
+						Text string `graphql:"text @include(if: $includeContent)"`
 					}
 					IsPublic  bool
 					Name      string
@@ -95,23 +100,42 @@ func ListGists(client *http.Client, hostname string, limit int, visibility strin
 	}
 
 	perPage := limit
-	if perPage > 100 {
-		perPage = 100
+	if perPage > maxPerPage {
+		perPage = maxPerPage
 	}
 
 	variables := map[string]interface{}{
-		"per_page":   githubv4.Int(perPage),
-		"endCursor":  (*githubv4.String)(nil),
-		"visibility": githubv4.GistPrivacy(strings.ToUpper(visibility)),
+		"per_page":       githubv4.Int(perPage),
+		"endCursor":      (*githubv4.String)(nil),
+		"visibility":     githubv4.GistPrivacy(strings.ToUpper(visibility)),
+		"includeContent": githubv4.Boolean(includeContent),
 	}
 
-	gql := graphql.NewClient(ghinstance.GraphQLEndpoint(hostname), client)
+	filterFunc := func(gist *Gist) bool {
+		if filter.MatchString(gist.Description) {
+			return true
+		}
+
+		for _, file := range gist.Files {
+			if filter.MatchString(file.Filename) {
+				return true
+			}
+
+			if includeContent && filter.MatchString(file.Content) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	gql := api.NewClientFromHTTP(client)
 
 	gists := []Gist{}
 pagination:
 	for {
 		var result response
-		err := gql.QueryNamed(context.Background(), "GistList", &result, variables)
+		err := gql.Query(hostname, "GistList", &result, variables)
 		if err != nil {
 			return nil, err
 		}
@@ -121,19 +145,22 @@ pagination:
 			for _, file := range gist.Files {
 				files[file.Name] = &GistFile{
 					Filename: file.Name,
+					Content:  file.Text,
 				}
 			}
 
-			gists = append(
-				gists,
-				Gist{
-					ID:          gist.Name,
-					Description: gist.Description,
-					Files:       files,
-					UpdatedAt:   gist.UpdatedAt,
-					Public:      gist.IsPublic,
-				},
-			)
+			gist := Gist{
+				ID:          gist.Name,
+				Description: gist.Description,
+				Files:       files,
+				UpdatedAt:   gist.UpdatedAt,
+				Public:      gist.IsPublic,
+			}
+
+			if filter == nil || filterFunc(&gist) {
+				gists = append(gists, gist)
+			}
+
 			if len(gists) == limit {
 				break pagination
 			}
@@ -173,4 +200,49 @@ func IsBinaryContents(contents []byte) bool {
 		}
 	}
 	return isBinary
+}
+
+func PromptGists(prompter prompter.Prompter, client *http.Client, host string, cs *iostreams.ColorScheme) (gistID string, err error) {
+	gists, err := ListGists(client, host, 10, nil, false, "all")
+	if err != nil {
+		return "", err
+	}
+
+	if len(gists) == 0 {
+		return "", nil
+	}
+
+	var opts []string
+	var gistIDs = make([]string, len(gists))
+
+	for i, gist := range gists {
+		gistIDs[i] = gist.ID
+		description := ""
+		gistName := ""
+
+		if gist.Description != "" {
+			description = gist.Description
+		}
+
+		filenames := make([]string, 0, len(gist.Files))
+		for fn := range gist.Files {
+			filenames = append(filenames, fn)
+		}
+		sort.Strings(filenames)
+		gistName = filenames[0]
+
+		gistTime := text.FuzzyAgo(time.Now(), gist.UpdatedAt)
+		// TODO: support dynamic maxWidth
+		description = text.Truncate(100, text.RemoveExcessiveWhitespace(description))
+		opt := fmt.Sprintf("%s %s %s", cs.Bold(gistName), description, cs.Gray(gistTime))
+		opts = append(opts, opt)
+	}
+
+	result, err := prompter.Select("Select a gist", "", opts)
+
+	if err != nil {
+		return "", err
+	}
+
+	return gistIDs[result], nil
 }
